@@ -1,0 +1,11 @@
+node_modules/
+apps/web/dist/
+apps/web/.vite/
+data/
+.env
+.env.*
+!.env.example
+coverage/
+*.log
+*.tmp
+.DS_Store
