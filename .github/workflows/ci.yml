@@ -1,0 +1,38 @@
+name: Validate Maya
+
+on:
+  push:
+    branches: [main, 'arena/**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck and test
+        run: npm run check
+
+      - name: Build web application
+        run: npm run build
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build Docker image with FFmpeg
+        run: docker build --tag maya-cloud-live:ci .

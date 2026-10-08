@@ -56,7 +56,8 @@ export class QueueService {
       delay: Math.max(0, delayMs),
       removeOnComplete: { age: 86_400, count: 500 },
       removeOnFail: { age: 7 * 86_400, count: 1_000 },
-      attempts: 1,
+      attempts: 1_000,
+      backoff: { type: 'fixed', delay: 5_000 },
     });
   }
 

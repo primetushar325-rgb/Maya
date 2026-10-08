@@ -3,7 +3,10 @@
   "short_name": "Maya Live",
   "description": "Control your server-side YouTube live streams.",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
   "background_color": "#0a1110",
   "theme_color": "#0a1110",
   "icons": [

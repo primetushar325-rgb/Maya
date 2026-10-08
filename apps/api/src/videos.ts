@@ -123,10 +123,12 @@ export function createVideosRouter(repository: Repository, storage: ObjectStorag
   router.delete('/:id', authenticated, async (request, response, next) => {
     try {
       const active = await repository.getActiveSession(request.userId!);
-      if (active?.videoId === pathId(request)) {
-        return response.status(409).json({ error: 'Stop the active stream before deleting this video.', code: 'video_in_use' });
+      const videoId = pathId(request);
+      const activePlaylist = active?.playlistId ? await repository.getPlaylist(request.userId!, active.playlistId) : null;
+      if (active?.videoId === videoId || activePlaylist?.items.some((item) => item.videoId === videoId)) {
+        return response.status(409).json({ error: 'Stop the active stream before deleting a video it uses.', code: 'video_in_use' });
       }
-      const video = await repository.deleteVideo(request.userId!, pathId(request));
+      const video = await repository.deleteVideo(request.userId!, videoId);
       if (!video) return response.status(404).json({ error: 'Video not found.', code: 'video_not_found' });
       await storage.delete(video.objectKey);
       await storage.delete(video.thumbnailKey);

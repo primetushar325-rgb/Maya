@@ -7,7 +7,7 @@ import path from 'node:path';
 import { Worker, type Job } from 'bullmq';
 import Redis from 'ioredis';
 import { decryptSecret, redactSensitiveText } from '../../../packages/core/src/security';
-import { buildConcatStreamArgs, buildProfileArgs, escapeConcatPath, parseProgressLine, retryDelayMs, safeFfmpegError } from '../../../packages/core/src/streaming';
+import { buildConcatStreamArgs, buildProfileArgs, escapeConcatPath, parseProgressLine, retryDelayMs, safeFfmpegError, STREAM_PROFILES } from '../../../packages/core/src/streaming';
 import type { LiveSessionRecord, VideoRecord } from '../../../packages/core/src/domain';
 import { config } from '../../api/src/config';
 import { Repository } from '../../api/src/repository';
@@ -18,7 +18,9 @@ import { youtubeService } from '../../api/src/youtube-service';
 
 interface RunningSession {
   child: ChildProcess | null;
+  processingChild: ChildProcess | null;
   stopRequested: boolean;
+  shutdownRequested: boolean;
   restartRequested: boolean;
   fatalError: string | null;
   hardKillTimer: NodeJS.Timeout | null;
@@ -29,6 +31,13 @@ interface ProgressState {
   lastWrittenAt: number;
   activated: boolean;
   currentIndex: number;
+}
+
+class RecoverableWorkerShutdownError extends Error {
+  constructor() {
+    super('Worker is shutting down; BullMQ will retry this stream job.');
+    this.name = 'RecoverableWorkerShutdownError';
+  }
 }
 
 const workerId = `${hostname()}-${process.pid}-${randomUUID().slice(0, 8)}`;
@@ -102,24 +111,50 @@ function parseFfmpegOutputLine(line: string, progress: ProgressState, sessionId:
   }
 }
 
-async function runCommand(command: string, args: string[], timeoutMs = 60 * 60 * 1000): Promise<void> {
+async function runCommand(
+  command: string,
+  args: string[],
+  timeoutMs = 60 * 60 * 1000,
+  state?: RunningSession,
+): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'], shell: false });
     let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error('Media processing exceeded its time limit.'));
+    let settled = false;
+    let timedOut = false;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+    let killTimer: NodeJS.Timeout | null = null;
+    if (state) state.processingChild = child;
+
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+      if (state?.processingChild === child) state.processingChild = null;
+      if (error) reject(error);
+      else resolve();
+    };
+
+    timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+      killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }, 10_000);
     }, timeoutMs);
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-12_000); });
     child.once('error', (error) => {
-      clearTimeout(timer);
-      reject(new Error(error.message.includes('ENOENT') ? `${command} is not installed in the streaming worker.` : 'Could not launch media processing.'));
+      const message = error.message.includes('ENOENT') ? `${command} is not installed in the streaming worker.` : 'Could not launch media processing.';
+      finish(new Error(message));
     });
-    child.once('close', (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(safeFfmpegError(stderr)));
+    child.once('close', (code, signal) => {
+      if (state?.shutdownRequested) return finish(new RecoverableWorkerShutdownError());
+      if (state?.stopRequested) return finish(new Error('Media processing stopped by request.'));
+      if (timedOut) return finish(new Error('Media processing exceeded its time limit.'));
+      if (code === 0) return finish();
+      finish(new Error(signal ? `Media processing stopped by ${signal}. ${safeFfmpegError(stderr)}` : safeFfmpegError(stderr)));
     });
   });
 }
@@ -150,18 +185,28 @@ async function getPlaylistVideos(session: LiveSessionRecord): Promise<VideoRecor
   return videos;
 }
 
-async function ensureProfile(video: VideoRecord, liveType: LiveSessionRecord['liveType'], tempDir: string, sessionId: string): Promise<string> {
+async function validateProfile(filePath: string, liveType: LiveSessionRecord['liveType']): Promise<void> {
+  const media = await probeMedia(filePath);
+  const profile = STREAM_PROFILES[liveType];
+  if (media.videoCodec !== 'h264' || media.audioCodec !== 'aac' || media.width !== profile.width || media.height !== profile.height) {
+    throw new Error('The cached stream profile is invalid. Reprocess the source video before streaming.');
+  }
+}
+
+async function ensureProfile(video: VideoRecord, liveType: LiveSessionRecord['liveType'], tempDir: string, sessionId: string, state: RunningSession): Promise<string> {
   const profileKey = `${video.userId}/processed/${video.id}/${liveType}-1080p30.mp4`;
   const outputPath = path.join(tempDir, `${video.id}-${liveType}.mp4`);
   if (await storage.exists(profileKey)) {
     await storage.downloadToFile(profileKey, outputPath);
+    await validateProfile(outputPath, liveType);
     return outputPath;
   }
   const sourcePath = path.join(tempDir, `${video.id}-source${path.extname(video.originalName).toLowerCase() || '.mp4'}`);
   await storage.downloadToFile(video.objectKey, sourcePath);
   const media = await probeMedia(sourcePath);
   const ffmpegArgs = buildProfileArgs(sourcePath, outputPath, liveType, Boolean(media.audioCodec), media.durationSeconds);
-  await runCommand(config.ffmpegBin, ffmpegArgs, Math.max(60 * 60 * 1000, media.durationSeconds * 4_000));
+  await runCommand(config.ffmpegBin, ffmpegArgs, Math.max(60 * 60 * 1000, media.durationSeconds * 4_000), state);
+  await validateProfile(outputPath, liveType);
   await storage.putFile(profileKey, outputPath, 'video/mp4');
   await repository.appendLog(sessionId, 'info', `Cached ${liveType} profile for ${video.title}.`).catch(() => undefined);
   return outputPath;
@@ -192,19 +237,26 @@ async function markTerminal(session: LiveSessionRecord, status: 'ended' | 'faile
   );
 }
 
+function terminateChildren(state: RunningSession, includeProcessing: boolean): void {
+  const targets = includeProcessing ? [state.child, state.processingChild] : [state.child];
+  const activeChildren = targets.filter((child): child is ChildProcess => Boolean(child && child.exitCode === null && child.signalCode === null));
+  for (const child of activeChildren) child.kill('SIGTERM');
+  if (activeChildren.length && !state.hardKillTimer) {
+    state.hardKillTimer = setTimeout(() => {
+      for (const child of [state.child, state.processingChild]) {
+        if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }
+      state.hardKillTimer = null;
+    }, 15_000);
+  }
+}
+
 function requestStop(sessionId: string, action: 'stop' | 'restart'): void {
   const state = running.get(sessionId);
   if (!state) return;
   if (action === 'restart') state.restartRequested = true;
   else state.stopRequested = true;
-  if (state.child && !state.child.killed) {
-    state.child.kill('SIGTERM');
-    if (!state.hardKillTimer) {
-      state.hardKillTimer = setTimeout(() => {
-        if (state.child && !state.child.killed) state.child.kill('SIGKILL');
-      }, 15_000);
-    }
-  }
+  terminateChildren(state, action === 'stop');
 }
 
 async function runFfmpeg(session: LiveSessionRecord, sourceVideos: VideoRecord[], manifestPath: string, ingestUrl: string, state: RunningSession): Promise<{
@@ -215,6 +267,10 @@ async function runFfmpeg(session: LiveSessionRecord, sourceVideos: VideoRecord[]
   fatalError: string | null;
 }> {
   if (state.stopRequested) return { code: 0, signal: null, stderr: '', wasActivated: false, fatalError: null };
+  if (state.restartRequested) {
+    state.restartRequested = false;
+    void repository.appendLog(session.id, 'info', 'Restart received before FFmpeg launch; starting with the current prepared profile.').catch(() => undefined);
+  }
   const progress: ProgressState = { values: {}, lastWrittenAt: Date.now(), activated: false, currentIndex: 0 };
   const cumulative: number[] = [];
   let elapsed = 0;
@@ -313,7 +369,7 @@ async function runFfmpeg(session: LiveSessionRecord, sourceVideos: VideoRecord[]
 async function processSession(sessionId: string): Promise<void> {
   const session = await repository.getSession(sessionId);
   if (!session) return;
-  const state: RunningSession = { child: null, stopRequested: false, restartRequested: false, fatalError: null, hardKillTimer: null };
+  const state: RunningSession = { child: null, processingChild: null, stopRequested: false, shutdownRequested: false, restartRequested: false, fatalError: null, hardKillTimer: null };
   running.set(sessionId, state);
   try {
     if (session.status === 'stopping') {
@@ -336,11 +392,17 @@ async function processSession(sessionId: string): Promise<void> {
       const profilePaths: string[] = [];
       const streamVideos: VideoRecord[] = [];
       for (const video of videos) {
+        if (state.shutdownRequested) throw new RecoverableWorkerShutdownError();
         if (state.stopRequested) break;
         try {
-          profilePaths.push(await ensureProfile(video, current.liveType, tempDir, sessionId));
+          const profilePath = await ensureProfile(video, current.liveType, tempDir, sessionId, state);
+          if (state.shutdownRequested) throw new RecoverableWorkerShutdownError();
+          if (state.stopRequested) break;
+          profilePaths.push(profilePath);
           streamVideos.push(video);
         } catch (error) {
+          if (state.shutdownRequested) throw new RecoverableWorkerShutdownError();
+          if (state.stopRequested) break;
           if (current.playlistId && current.skipFailedVideos) {
             await repository.appendLog(sessionId, 'warn', `Skipped ${video.title} after profile processing failed: ${error instanceof Error ? error.message : 'media error'}`);
             continue;
@@ -351,6 +413,10 @@ async function processSession(sessionId: string): Promise<void> {
       if (state.stopRequested) {
         await markTerminal(current, 'ended', null);
         return;
+      }
+      if (state.restartRequested) {
+        state.restartRequested = false;
+        await repository.appendLog(sessionId, 'info', 'Restart received while preparing; continuing with the freshly prepared stream.');
       }
       if (profilePaths.length === 0) throw new Error('No playlist items could be prepared for streaming.');
       const manifestPath = path.join(tempDir, 'playlist.ffconcat');
@@ -370,6 +436,7 @@ async function processSession(sessionId: string): Promise<void> {
         });
         if (attempts) await repository.appendLog(sessionId, 'warn', `Reconnecting to RTMP ingest (attempt ${attempts}).`);
         const result = await runFfmpeg(current, streamVideos, manifestPath, ingestUrl, state);
+        if (state.shutdownRequested) throw new RecoverableWorkerShutdownError();
         if (state.stopRequested) {
           await repository.appendLog(sessionId, 'info', 'FFmpeg stopped after a user or administrator request.');
           await markTerminal(current, 'ended', null);
@@ -407,6 +474,18 @@ async function processSession(sessionId: string): Promise<void> {
       await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
     }
   } catch (error) {
+    if (state.shutdownRequested) {
+      await repository.updateSession(sessionId, {
+        status: 'reconnecting', healthStatus: 'warning', workerId: null, errorMessage: null,
+      }).catch(() => undefined);
+      await repository.appendLog(sessionId, 'warn', 'Worker is restarting; BullMQ will recover this stream job.').catch(() => undefined);
+      throw error instanceof RecoverableWorkerShutdownError ? error : new RecoverableWorkerShutdownError();
+    }
+    if (state.stopRequested) {
+      await repository.appendLog(sessionId, 'info', 'Stream preparation stopped by user or administrator request.').catch(() => undefined);
+      await markTerminal(session, 'ended', null).catch(() => undefined);
+      return;
+    }
     const message = error instanceof Error ? error.message : 'Unexpected streaming worker error.';
     await repository.appendLog(sessionId, 'error', message).catch(() => undefined);
     await markTerminal(session, 'failed', message).catch(() => undefined);
@@ -444,6 +523,10 @@ async function startWorker(): Promise<void> {
   if (!config.databaseUrl || !config.redisUrl) {
     throw new Error('The streaming worker requires DATABASE_URL and REDIS_URL. Use Docker Compose or configure both services.');
   }
+  await Promise.all([
+    runCommand(config.ffmpegBin, ['-version'], 10_000),
+    runCommand(config.ffprobeBin, ['-version'], 10_000),
+  ]);
   await repository.init();
   await storage.init();
   commandConnection = new Redis(config.redisUrl, { maxRetriesPerRequest: null });
@@ -490,9 +573,9 @@ async function shutdown(): Promise<void> {
   console.log('Stopping stream worker…');
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   for (const [sessionId, state] of running) {
-    state.stopRequested = true;
-    if (state.child && !state.child.killed) state.child.kill('SIGTERM');
-    await repository.appendLog(sessionId, 'warn', 'Worker is shutting down; stream will be left recoverable.').catch(() => undefined);
+    state.shutdownRequested = true;
+    terminateChildren(state, true);
+    await repository.appendLog(sessionId, 'warn', 'Worker is shutting down; BullMQ will retry the stream after restart.').catch(() => undefined);
   }
   await Promise.all([worker?.close(), controlWorker?.close()]);
   await Promise.allSettled([subscriber?.quit(), commandConnection?.quit(), repository.close()]);

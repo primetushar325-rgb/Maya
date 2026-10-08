@@ -30,7 +30,7 @@ The included Docker Compose stack provides PostgreSQL, Redis, MinIO, API and wor
 - **Redis + BullMQ:** durable/delayed stream jobs and control-plane events. Scheduled jobs are persisted in Postgres and mirrored to Redis; the database remains the source of truth.
 - **S3-compatible object storage:** source files and derived H.264/AAC profiles are private. Local filesystem storage is available for development.
 - **FFmpeg/ffprobe worker:** probes uploads, preserves aspect ratio with scale-and-pad, normalizes to a stable 30 fps H.264/AAC profile, caches processed outputs, and streams from the server. It does not expose FFmpeg arguments to dashboard users.
-- **Mobile:** installable web/PWA control panel works on Android browsers. No long-running mobile media task is used. A native APK can later use the same authenticated REST API.
+- **Mobile:** installable web/PWA control panel works on Android browsers. Its service worker caches only the static app shell; API controls still require network. No long-running mobile media task is used, so an active stream remains on the server if the phone closes or disconnects. A native APK is a separate client build against the same authenticated REST API.
 
 ## Data model
 
@@ -70,10 +70,11 @@ Manual RTMP mode is intentionally restricted to YouTube-owned ingest hostnames t
 
 1. API validates ownership/readiness, confirms exactly one source (video or playlist), resolves a configured destination, creates a session, and enqueues a unique job ID.
 2. Worker atomically claims the session in PostgreSQL. A unique active-session index and the claim prevent duplicate workers for the same user/session.
-3. Worker downloads source files to a private temporary directory, probes them, builds/caches the selected vertical/horizontal profile, and writes a private concat manifest.
-4. FFmpeg sends H.264/AAC to the encrypted ingest URL. The worker records redacted logs, heartbeat/health, elapsed time and retry count.
-5. A stop control event sends a graceful termination signal. Non-zero FFmpeg exits get bounded exponential-backoff reconnects; natural end with loop off marks the session ended. Temporary files are removed in `finally` blocks.
-6. OAuth sessions create an event-specific broadcast and stream, bind them, wait for the ingest to become active before transitioning live, and mark the broadcast complete on stop. Manual RTMP mode uses a broadcast already configured by the channel owner in YouTube Studio.
+3. Worker downloads source files to a private temporary directory, probes them, builds/caches the selected vertical/horizontal profile, verifies cached profiles are H.264/AAC at the requested resolution, and writes a private concat manifest. If playlist skip mode is enabled, unavailable or unprocessable items are logged and skipped; an empty playable list still fails safely.
+4. FFmpeg sends H.264/AAC to the encrypted ingest URL. The worker records redacted logs, heartbeat/health, elapsed time and retry count. Worker startup verifies both `ffmpeg` and `ffprobe` exist before it advertises a healthy heartbeat.
+5. A dedicated control queue handles scheduled stops independently of long-running stream jobs. A user stop sends a graceful termination signal (then force-kills after a timeout); non-zero FFmpeg exits get bounded exponential-backoff reconnects; natural end with loop off marks the session ended. Temporary files are removed in `finally` blocks.
+6. On worker shutdown, active FFmpeg children are stopped, sessions are marked reconnecting, and BullMQ retries the same durable job after restart instead of falsely marking the broadcast complete.
+7. OAuth sessions create an event-specific broadcast and stream, bind them, wait for the ingest to become active before transitioning live, and mark the broadcast complete on stop. Manual RTMP mode uses a broadcast already configured by the channel owner in YouTube Studio.
 
 The database session ID is the BullMQ job ID. Each user has a partial unique index allowing only one active or scheduled session at a time. This is deliberate: channel concurrency limits are controlled by YouTube and can be lower than the service limit.
 
